@@ -1,0 +1,1302 @@
+# Project structure
+|  .gitignore
+|  algotradingbots
+|  |  asgi.py
+|  |  celery.py
+|  |  settings.py
+|  |  urls.py
+|  |  wsgi.py
+|  |  __init__.py
+|  backtest
+|  |  admin.py
+|  |  apps.py
+|  |  management
+|  |  |  commands
+|  |  |  |  download_sample_data.py
+|  |  |  |  run_sample_backtest.py
+|  |  |  |  setup_strategies.py
+|  |  |  |  __init__.py
+|  |  |  __init__.py
+|  |  migrations
+|  |  |  0001_initial.py
+|  |  |  __init__.py
+|  |  models.py
+|  |  serializers.py
+|  |  tasks.py
+|  |  tests.py
+|  |  urls.py
+|  |  views.py
+|  |  __init__.py
+|  db.sqlite3
+|  logs
+|  |  celery.log
+|  |  django.log
+|  manage.py
+|  notes.txt
+|  README.md
+|  requirements.txt
+|  save_structure.sh
+|  strategies
+|  |  SMAStrategy.py
+|  structure.txt
+|  user_data
+|  |  backtest_results
+|  |  data
+|  |  |  binance
+
+# algotradingbots\celery.py
+# algotradingbots/celery.py
+import os
+from celery import Celery
+from django.conf import settings
+
+# Set the default Django settings module for the 'celery' program
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'algotradingbots.settings')
+
+app = Celery('algotradingbots')
+
+# Using a string here means the worker doesn't have to serialize
+# the configuration object to child processes
+app.config_from_object('django.conf:settings', namespace='CELERY')
+
+# Load task modules from all registered Django app configs
+app.autodiscover_tasks()
+
+# Celery configuration
+app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+    result_backend='redis://localhost:6379/0',
+    broker_url='redis://localhost:6379/0',
+    task_always_eager=False,
+    task_eager_propagates=True,
+    task_ignore_result=False,
+    task_store_eager_result=True,
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
+    worker_max_tasks_per_child=50,
+)
+
+# Task routing (optional)
+app.conf.task_routes = {
+    'backtest.tasks.run_backtest_task': {'queue': 'backtest'},
+    'backtest.tasks.download_market_data': {'queue': 'data'},
+    'backtest.tasks.cleanup_old_jobs': {'queue': 'maintenance'},
+}
+
+# Periodic tasks
+from celery.schedules import crontab
+
+app.conf.beat_schedule = {
+    'cleanup-old-jobs': {
+        'task': 'backtest.tasks.cleanup_old_jobs',
+        'schedule': crontab(hour=2, minute=0),  # Daily at 2 AM
+    },
+}
+
+@app.task(bind=True)
+def debug_task(self):
+    print(f'Request: {self.request!r}')
+
+# Add to algotradingbots/__init__.py
+# This will make sure the app is always imported when
+# Django starts so that shared_task will use this app.
+from .celery import app as celery_app
+
+__all__ = ('celery_app',)
+
+# algotradingbots\urls.py
+# algotradingbots/urls.py
+"""
+URL configuration for algotradingbots project.
+"""
+from django.contrib import admin
+from django.urls import path, include
+from debug_toolbar.toolbar import debug_toolbar_urls
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('api-auth/', include('rest_framework.urls')),
+    path('backtest/', include('backtest.urls')),
+    path('api/v1/backtest/', include('backtest.urls')),
+] + debug_toolbar_urls()
+
+# Simple home view
+from django.http import JsonResponse
+
+def api_info(request):
+    return JsonResponse({
+        'service': 'SmartTradeBots Backtesting API',
+        'version': '1.0',
+        'endpoints': {
+            'strategies': '/api/v1/backtest/api/strategies/',
+            'jobs': '/api/v1/backtest/api/jobs/',
+            'results': '/api/v1/backtest/api/results/',
+            'admin': '/admin/'
+        },
+        'docs': 'https://smarttradebots.com/docs'
+    })
+
+urlpatterns.insert(0, path('', api_info, name='api_info'))
+
+# commands
+# backtest\management\commands\download_sample_data.py
+from django.core.management.base import BaseCommand
+from datetime import datetime, timedelta
+from backtest.tasks import download_market_data
+
+class Command(BaseCommand):
+    help = 'Download sample market data for backtesting'
+    
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--pairs',
+            nargs='+',
+            default=['BTC/USDT', 'ETH/USDT', 'ADA/USDT'],
+            help='Trading pairs to download'
+        )
+        parser.add_argument(
+            '--timeframes',
+            nargs='+', 
+            default=['1h', '4h', '1d'],
+            help='Timeframes to download'
+        )
+        parser.add_argument(
+            '--days',
+            type=int,
+            default=90,
+            help='Number of days of historical data'
+        )
+    
+    def handle(self, *args, **options):
+        pairs = options['pairs']
+        timeframes = options['timeframes'] 
+        days = options['days']
+        
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+        
+        self.stdout.write(f'Downloading data for {len(pairs)} pairs')
+        self.stdout.write(f'Timeframes: {", ".join(timeframes)}')
+        self.stdout.write(f'Date range: {start_str} to {end_str}')
+        
+        for timeframe in timeframes:
+            self.stdout.write(f'\nDownloading {timeframe} data...')
+            
+            try:
+                # Queue download task
+                task = download_market_data.delay(pairs, timeframe, start_str, end_str)
+                result = task.get(timeout=300)  # 5 minute timeout
+                
+                self.stdout.write(
+                    self.style.SUCCESS(f'✓ {timeframe}: {result}')
+                )
+                
+            except Exception as e:
+                self.stdout.write(
+                    self.style.ERROR(f'✗ {timeframe}: {str(e)}')
+                )
+        
+        self.stdout.write(
+            self.style.SUCCESS(f'\nData download complete!')
+        )
+# backtest\management\commands\run_sample_backtest.py
+from django.core.management.base import BaseCommand
+from backtest.models import TradingStrategy, BacktestJob
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+class Command(BaseCommand):
+    help = 'Run a sample backtest to verify setup'
+    
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--strategy',
+            default='SMAStrategy',
+            help='Strategy name to test'
+        )
+    
+    def handle(self, *args, **options):
+        strategy_name = options['strategy']
+        
+        try:
+            strategy = TradingStrategy.objects.get(name=strategy_name)
+        except TradingStrategy.DoesNotExist:
+            self.stdout.write(
+                self.style.ERROR(f'Strategy "{strategy_name}" not found')
+            )
+            return
+        
+        # Create sample backtest job
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=30)  # 30 days
+        
+        job = BacktestJob.objects.create(
+            strategy=strategy,
+            start_date=start_date,
+            end_date=end_date,
+            initial_balance=Decimal('10000'),
+            pairs=['BTC/USDT', 'ETH/USDT'],
+            timeframe='1h'
+        )
+        
+        self.stdout.write(
+            self.style.SUCCESS(f'Created sample backtest job: {job.id}')
+        )
+        self.stdout.write(f'Strategy: {strategy.name}')
+        self.stdout.write(f'Date range: {start_date} to {end_date}')
+        self.stdout.write(f'Pairs: {job.pairs}')
+        self.stdout.write(f'Timeframe: {job.timeframe}')
+        
+        self.stdout.write(
+            self.style.SUCCESS(
+                f'\nBacktest queued! Check status in:\n'
+                f'- Admin: /admin/backtest/backtestjob/{job.id}/\n'
+                f'- API: /api/v1/backtest/api/jobs/{job.id}/'
+            )
+        )
+# backtest\management\commands\setup_strategies.py
+from django.core.management.base import BaseCommand
+from django.conf import settings
+from backtest.models import TradingStrategy
+import os
+
+class Command(BaseCommand):
+    help = 'Setup initial trading strategies'
+    
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--strategies-dir',
+            default='strategies',
+            help='Directory containing strategy files'
+        )
+    
+    def handle(self, *args, **options):
+        strategies_dir = options['strategies_dir']
+        
+        # Create strategies directory if it doesn't exist
+        if not os.path.exists(strategies_dir):
+            os.makedirs(strategies_dir)
+            self.stdout.write(f'Created strategies directory: {strategies_dir}')
+        
+        # Sample strategies to create
+        sample_strategies = [
+            {
+                'name': 'SMAStrategy',
+                'description': 'Simple Moving Average crossover strategy with RSI filter',
+                'file_path': f'{strategies_dir}/SMAStrategy.py',
+                'default_config': {
+                    'fast_sma': 9,
+                    'slow_sma': 21,
+                    'minimal_roi': {
+                        '60': 0.01,
+                        '30': 0.02, 
+                        '0': 0.04
+                    },
+                    'stoploss': -0.10
+                }
+            },
+            {
+                'name': 'BBRSIStrategy',
+                'description': 'Bollinger Bands with RSI strategy',
+                'file_path': f'{strategies_dir}/BBRSIStrategy.py',
+                'default_config': {
+                    'bb_period': 20,
+                    'bb_std': 2,
+                    'rsi_period': 14,
+                    'rsi_overbought': 70,
+                    'rsi_oversold': 30
+                }
+            },
+            {
+                'name': 'MACDStrategy', 
+                'description': 'MACD signal line crossover with volume filter',
+                'file_path': f'{strategies_dir}/MACDStrategy.py',
+                'default_config': {
+                    'macd_fast': 12,
+                    'macd_slow': 26,
+                    'macd_signal': 9,
+                    'volume_threshold': 1.2
+                }
+            }
+        ]
+        
+        created_count = 0
+        for strategy_data in sample_strategies:
+            strategy, created = TradingStrategy.objects.get_or_create(
+                name=strategy_data['name'],
+                defaults=strategy_data
+            )
+            
+            if created:
+                created_count += 1
+                self.stdout.write(
+                    self.style.SUCCESS(f'Created strategy: {strategy.name}')
+                )
+            else:
+                self.stdout.write(
+                    self.style.WARNING(f'Strategy already exists: {strategy.name}')
+                )
+        
+        self.stdout.write(
+            self.style.SUCCESS(f'\nSetup complete! Created {created_count} new strategies.')
+        )
+        
+        if created_count > 0:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f'\nNext steps:\n'
+                    f'1. Implement strategy files in {strategies_dir}/ directory\n'
+                    f'2. Run: python manage.py download_sample_data\n'
+                    f'3. Test backtesting via admin or API\n'
+                )
+            )
+
+# backtest\models.py
+from django.db import models
+from django.contrib.auth.models import User
+import json
+from decimal import Decimal
+
+class TradingStrategy(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True)
+    file_path = models.CharField(max_length=255)  # path to .py strategy file
+    default_config = models.JSONField(default=dict)  # default strategy parameters
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'trading_strategies'
+        
+    def __str__(self):
+        return self.name
+
+class BacktestJob(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('running', 'Running'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+    
+    strategy = models.ForeignKey(TradingStrategy, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
+    
+    # Backtest parameters
+    start_date = models.DateField()
+    end_date = models.DateField()
+    initial_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('10000'))
+    pairs = models.JSONField(default=list)  # ['BTC/USDT', 'ETH/USDT']
+    timeframe = models.CharField(max_length=10, default='1h')
+    
+    # Strategy specific config
+    strategy_config = models.JSONField(default=dict)
+    
+    # Job status
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    progress = models.IntegerField(default=0)  # 0-100
+    error_message = models.TextField(blank=True)
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        db_table = 'backtest_jobs'
+        ordering = ['-created_at']
+        
+    def __str__(self):
+        return f"{self.strategy.name} - {self.start_date} to {self.end_date}"
+
+class BacktestResult(models.Model):
+    job = models.OneToOneField(BacktestJob, on_delete=models.CASCADE, related_name='result')
+    
+    # Performance Metrics
+    total_trades = models.IntegerField(default=0)
+    winning_trades = models.IntegerField(default=0)
+    losing_trades = models.IntegerField(default=0)
+    
+    # Returns
+    total_return_pct = models.DecimalField(max_digits=10, decimal_places=4, default=0)
+    total_return_abs = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    annual_return_pct = models.DecimalField(max_digits=10, decimal_places=4, default=0)
+    
+    # Risk Metrics
+    max_drawdown_pct = models.DecimalField(max_digits=10, decimal_places=4, default=0)
+    max_drawdown_abs = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    sharpe_ratio = models.DecimalField(max_digits=6, decimal_places=3, default=0)
+    calmar_ratio = models.DecimalField(max_digits=6, decimal_places=3, default=0)
+    
+    # Win Rate
+    win_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)  # percentage
+    profit_factor = models.DecimalField(max_digits=6, decimal_places=3, default=0)
+    
+    # Average metrics
+    avg_winning_trade = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    avg_losing_trade = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    avg_trade_duration_hours = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    
+    # Final balance
+    final_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    
+    # Raw data storage
+    trades_data = models.JSONField(default=list)  # List of all trades
+    daily_stats = models.JSONField(default=dict)  # Daily performance data
+    equity_curve = models.JSONField(default=list)  # For charting
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'backtest_results'
+        
+    def __str__(self):
+        return f"Result for {self.job.strategy.name} - {self.total_return_pct}%"
+    
+    @property
+    def win_loss_ratio(self):
+        if self.losing_trades == 0:
+            return float('inf') if self.winning_trades > 0 else 0
+        return self.winning_trades / self.losing_trades
+    
+    @property 
+    def expectancy(self):
+        if self.total_trades == 0:
+            return 0
+        win_rate = self.win_rate / 100
+        avg_win = float(self.avg_winning_trade)
+        avg_loss = float(abs(self.avg_losing_trade))
+        return (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+
+class MarketData(models.Model):
+    """Cache for market data to avoid repeated API calls"""
+    pair = models.CharField(max_length=20)  # BTC/USDT
+    timeframe = models.CharField(max_length=10)  # 1h, 4h, 1d
+    date = models.DateField()
+    
+    # OHLCV data
+    open_price = models.DecimalField(max_digits=20, decimal_places=8)
+    high_price = models.DecimalField(max_digits=20, decimal_places=8) 
+    low_price = models.DecimalField(max_digits=20, decimal_places=8)
+    close_price = models.DecimalField(max_digits=20, decimal_places=8)
+    volume = models.DecimalField(max_digits=20, decimal_places=8)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'market_data'
+        unique_together = ['pair', 'timeframe', 'date']
+        indexes = [
+            models.Index(fields=['pair', 'timeframe', 'date']),
+        ]
+        
+    def __str__(self):
+        return f"{self.pair} {self.timeframe} {self.date}"
+# backtest\serializers.py
+from rest_framework import serializers
+from .models import TradingStrategy, BacktestJob, BacktestResult
+from datetime import date, timedelta
+
+class TradingStrategySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TradingStrategy
+        fields = ['id', 'name', 'description', 'default_config', 'is_active', 'created_at']
+        read_only_fields = ['created_at']
+
+class BacktestJobCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BacktestJob
+        fields = [
+            'strategy', 'start_date', 'end_date', 'initial_balance', 
+            'pairs', 'timeframe', 'strategy_config'
+        ]
+    
+    def validate(self, data):
+        # Validate date range
+        if data['start_date'] >= data['end_date']:
+            raise serializers.ValidationError("End date must be after start date")
+        
+        # Don't allow backtests too far in the future
+        if data['end_date'] > date.today():
+            raise serializers.ValidationError("End date cannot be in the future")
+        
+        # Reasonable time range (max 3 years for performance)
+        if (data['end_date'] - data['start_date']).days > 1095:
+            raise serializers.ValidationError("Date range cannot exceed 3 years")
+        
+        # Validate pairs format
+        if not data.get('pairs') or not isinstance(data['pairs'], list):
+            raise serializers.ValidationError("At least one trading pair is required")
+        
+        # Basic validation of pair format
+        for pair in data['pairs']:
+            if not isinstance(pair, str) or '/' not in pair:
+                raise serializers.ValidationError(f"Invalid pair format: {pair}")
+        
+        # Validate timeframe
+        valid_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
+        if data.get('timeframe') not in valid_timeframes:
+            raise serializers.ValidationError(f"Timeframe must be one of: {valid_timeframes}")
+        
+        return data
+
+class BacktestResultSerializer(serializers.ModelSerializer):
+    win_loss_ratio = serializers.ReadOnlyField()
+    expectancy = serializers.ReadOnlyField()
+    
+    class Meta:
+        model = BacktestResult
+        fields = [
+            'total_trades', 'winning_trades', 'losing_trades',
+            'total_return_pct', 'total_return_abs', 'annual_return_pct',
+            'max_drawdown_pct', 'max_drawdown_abs', 'sharpe_ratio', 'calmar_ratio',
+            'win_rate', 'profit_factor', 'win_loss_ratio', 'expectancy',
+            'avg_winning_trade', 'avg_losing_trade', 'avg_trade_duration_hours',
+            'final_balance', 'created_at'
+        ]
+
+class BacktestJobSerializer(serializers.ModelSerializer):
+    strategy_name = serializers.CharField(source='strategy.name', read_only=True)
+    result = BacktestResultSerializer(read_only=True)
+    
+    class Meta:
+        model = BacktestJob
+        fields = [
+            'id', 'strategy', 'strategy_name', 'start_date', 'end_date',
+            'initial_balance', 'pairs', 'timeframe', 'strategy_config',
+            'status', 'progress', 'error_message',
+            'created_at', 'started_at', 'completed_at', 'result'
+        ]
+        read_only_fields = [
+            'id', 'status', 'progress', 'error_message', 
+            'created_at', 'started_at', 'completed_at'
+        ]
+
+class BacktestJobListSerializer(serializers.ModelSerializer):
+    """Lighter serializer for job listings"""
+    strategy_name = serializers.CharField(source='strategy.name', read_only=True)
+    duration_days = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = BacktestJob
+        fields = [
+            'id', 'strategy_name', 'start_date', 'end_date', 'duration_days',
+            'pairs', 'timeframe', 'status', 'progress', 'created_at'
+        ]
+    
+    def get_duration_days(self, obj):
+        return (obj.end_date - obj.start_date).days
+
+class BacktestResultDetailSerializer(serializers.ModelSerializer):
+    """Detailed result serializer including trade data"""
+    job_info = BacktestJobListSerializer(source='job', read_only=True)
+    win_loss_ratio = serializers.ReadOnlyField()
+    expectancy = serializers.ReadOnlyField()
+    
+    class Meta:
+        model = BacktestResult
+        fields = [
+            'job_info',
+            'total_trades', 'winning_trades', 'losing_trades',
+            'total_return_pct', 'total_return_abs', 'annual_return_pct',
+            'max_drawdown_pct', 'max_drawdown_abs', 'sharpe_ratio', 'calmar_ratio',
+            'win_rate', 'profit_factor', 'win_loss_ratio', 'expectancy',
+            'avg_winning_trade', 'avg_losing_trade', 'avg_trade_duration_hours',
+            'final_balance', 'trades_data', 'daily_stats', 'equity_curve',
+            'created_at'
+        ]
+# backtest\tasks.py
+from celery import shared_task
+from django.utils import timezone
+from decimal import Decimal
+import subprocess
+import json
+import tempfile
+import os
+import logging
+from pathlib import Path
+
+from .models import BacktestJob, BacktestResult, TradingStrategy
+
+logger = logging.getLogger(__name__)
+
+@shared_task
+def run_backtest_task(job_id):
+    """
+    Run a backtest using Freqtrade
+    """
+    try:
+        job = BacktestJob.objects.get(id=job_id)
+        logger.info(f"Starting backtest job {job_id}")
+        
+        # Update job status
+        job.status = 'running'
+        job.started_at = timezone.now()
+        job.progress = 10
+        job.save()
+        
+        # Prepare freqtrade config
+        config = prepare_freqtrade_config(job)
+        
+        # Create temporary config file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(config, f, indent=2)
+            config_file = f.name
+        
+        try:
+            job.progress = 30
+            job.save()
+            
+            # Run freqtrade backtest
+            result = run_freqtrade_backtest(config_file, job)
+            
+            job.progress = 80
+            job.save()
+            
+            # Parse and save results
+            backtest_result = parse_and_save_results(job, result)
+            
+            job.status = 'completed'
+            job.completed_at = timezone.now()
+            job.progress = 100
+            job.save()
+            
+            logger.info(f"Completed backtest job {job_id} successfully")
+            return f"Backtest completed with {backtest_result.total_trades} trades"
+            
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(config_file)
+            except:
+                pass
+                
+    except BacktestJob.DoesNotExist:
+        logger.error(f"Backtest job {job_id} not found")
+        return f"Job {job_id} not found"
+        
+    except Exception as e:
+        logger.error(f"Backtest job {job_id} failed: {str(e)}")
+        
+        # Update job with error
+        try:
+            job = BacktestJob.objects.get(id=job_id)
+            job.status = 'failed'
+            job.error_message = str(e)
+            job.completed_at = timezone.now()
+            job.save()
+        except:
+            pass
+            
+        return f"Backtest failed: {str(e)}"
+
+def prepare_freqtrade_config(job):
+    """
+    Prepare Freqtrade configuration for the backtest
+    """
+    base_config = {
+        "trading_mode": "backtest",
+        "dry_run": True,
+        "timeframe": job.timeframe,
+        "timeframe_detail": "1m",  # For better accuracy
+        "startup_candle_count": 400,
+        "process_only_new_candles": True,
+        
+        # Strategy
+        "strategy": job.strategy.name,
+        "strategy_path": [str(Path(job.strategy.file_path).parent)],
+        
+        # Exchange settings
+        "exchange": {
+            "name": "binance",  # Default exchange
+            "sandbox": False,
+            "key": "",
+            "secret": "",
+            "ccxt_config": {},
+            "ccxt_async_config": {},
+            "pair_whitelist": job.pairs,
+            "pair_blacklist": []
+        },
+        
+        # Backtest specific
+        "backtest": {
+            "initial_balance": float(job.initial_balance),
+            "start_date": job.start_date.strftime("%Y-%m-%d"),
+            "end_date": job.end_date.strftime("%Y-%m-%d"),
+            "trade_source": "ohlcv",
+            "enable_protections": False,
+            "backtest_breakdown": ["day", "week", "month"]
+        },
+        
+        # Data settings
+        "datadir": "user_data/data/binance",
+        "pairs": job.pairs,
+        "timeframes": {job.timeframe: job.timeframe},
+        
+        # Entry/Exit settings
+        "entry_pricing": {
+            "price_side": "same",
+            "use_order_book": False,
+            "order_book_top": 1,
+            "price_last_balance": 0.0,
+            "check_depth_of_market": {
+                "enabled": False
+            }
+        },
+        
+        "exit_pricing": {
+            "price_side": "same",
+            "use_order_book": False,
+            "order_book_top": 1,
+            "price_last_balance": 0.0
+        },
+        
+        # Logging
+        "logging": {
+            "verbosity": 2
+        },
+        
+        # Telegram (disabled for backtest)
+        "telegram": {
+            "enabled": False
+        },
+        
+        # API (disabled for backtest)
+        "api_server": {
+            "enabled": False
+        }
+    }
+    
+    # Merge strategy-specific config
+    if job.strategy_config:
+        base_config.update(job.strategy_config)
+    
+    # Add default config from strategy
+    if job.strategy.default_config:
+        base_config.update(job.strategy.default_config)
+    
+    return base_config
+
+def run_freqtrade_backtest(config_file, job):
+    """
+    Execute freqtrade backtest command
+    """
+    cmd = [
+        'freqtrade',
+        'backtesting',
+        '--config', config_file,
+        '--strategy', job.strategy.name,
+        '--timerange', f"{job.start_date.strftime('%Y%m%d')}-{job.end_date.strftime('%Y%m%d')}",
+        '--breakdown', 'day',
+        '--export', 'trades',
+        '--export-filename', f'backtest_result_{job.id}.json'
+    ]
+    
+    # Add pairs to command
+    for pair in job.pairs:
+        cmd.extend(['--pairs', pair])
+    
+    logger.info(f"Running command: {' '.join(cmd)}")
+    
+    # Run the command
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=3600  # 1 hour timeout
+    )
+    
+    if result.returncode != 0:
+        error_msg = f"Freqtrade failed: {result.stderr}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    return result.stdout
+
+def parse_and_save_results(job, freqtrade_output):
+    """
+    Parse Freqtrade output and save results to database
+    """
+    # Try to find the results file
+    results_file = f"user_data/backtest_results/backtest_result_{job.id}.json"
+    
+    if not os.path.exists(results_file):
+        # Fallback: parse from stdout
+        results_data = parse_freqtrade_stdout(freqtrade_output)
+    else:
+        with open(results_file, 'r') as f:
+            results_data = json.load(f)
+    
+    # Extract key metrics
+    strategy_stats = results_data['strategy'][job.strategy.name]
+    
+    # Create BacktestResult
+    backtest_result = BacktestResult.objects.create(
+        job=job,
+        total_trades=strategy_stats.get('total_trades', 0),
+        winning_trades=strategy_stats.get('wins', 0),
+        losing_trades=strategy_stats.get('losses', 0),
+        
+        # Returns
+        total_return_pct=Decimal(str(strategy_stats.get('profit_total_pct', 0))),
+        total_return_abs=Decimal(str(strategy_stats.get('profit_total_abs', 0))),
+        annual_return_pct=Decimal(str(strategy_stats.get('profit_total_pct', 0) * 365 / max(1, (job.end_date - job.start_date).days))),
+        
+        # Risk metrics
+        max_drawdown_pct=Decimal(str(abs(strategy_stats.get('max_drawdown', 0)))),
+        max_drawdown_abs=Decimal(str(abs(strategy_stats.get('max_drawdown_abs', 0)))),
+        sharpe_ratio=Decimal(str(strategy_stats.get('sharpe', 0))),
+        calmar_ratio=Decimal(str(strategy_stats.get('calmar', 0))),
+        
+        # Win rate and ratios
+        win_rate=Decimal(str(strategy_stats.get('win_rate', 0))),
+        profit_factor=Decimal(str(strategy_stats.get('profit_factor', 0))),
+        
+        # Average trades
+        avg_winning_trade=Decimal(str(strategy_stats.get('avg_profit', 0))),
+        avg_losing_trade=Decimal(str(strategy_stats.get('avg_loss', 0))),
+        avg_trade_duration_hours=Decimal(str(convert_duration_to_hours(strategy_stats.get('avg_duration', '0:00:00')))),
+        
+        # Final balance
+        final_balance=Decimal(str(float(job.initial_balance) + strategy_stats.get('profit_total_abs', 0))),
+        
+        # Raw data
+        trades_data=results_data.get('trades', []),
+        daily_stats=strategy_stats.get('daily_stats', {}),
+        equity_curve=generate_equity_curve(results_data.get('trades', []), float(job.initial_balance))
+    )
+    
+    # Clean up results file
+    try:
+        os.unlink(results_file)
+    except:
+        pass
+    
+    return backtest_result
+
+def parse_freqtrade_stdout(output):
+    """
+    Parse freqtrade output when JSON file is not available
+    """
+    # Basic parsing of freqtrade stdout
+    # This is a fallback and may need adjustment based on freqtrade output format
+    
+    lines = output.split('\n')
+    results = {
+        'strategy': {},
+        'trades': []
+    }
+    
+    # Try to extract basic stats from output
+    for line in lines:
+        if 'BACKTESTING REPORT' in line:
+            # Start parsing results section
+            continue
+        # Add more parsing logic here based on freqtrade output format
+    
+    return results
+
+def convert_duration_to_hours(duration_str):
+    """
+    Convert duration string like '2 days, 3:45:30' to hours
+    """
+    if not duration_str or duration_str == '0:00:00':
+        return 0
+    
+    try:
+        # Handle various duration formats
+        if 'day' in duration_str:
+            parts = duration_str.split(', ')
+            days = int(parts[0].split()[0])
+            time_part = parts[1] if len(parts) > 1 else '0:00:00'
+        else:
+            days = 0
+            time_part = duration_str
+        
+        # Parse time part (H:M:S)
+        time_parts = time_part.split(':')
+        hours = int(time_parts[0])
+        minutes = int(time_parts[1]) if len(time_parts) > 1 else 0
+        seconds = int(time_parts[2]) if len(time_parts) > 2 else 0
+        
+        total_hours = days * 24 + hours + minutes / 60 + seconds / 3600
+        return round(total_hours, 2)
+        
+    except (ValueError, IndexError):
+        return 0
+
+def generate_equity_curve(trades, initial_balance):
+    """
+    Generate equity curve data from trades
+    """
+    if not trades:
+        return []
+    
+    equity_curve = []
+    current_balance = initial_balance
+    
+    for trade in trades:
+        current_balance += trade.get('profit_abs', 0)
+        equity_curve.append({
+            'timestamp': trade.get('close_date', ''),
+            'balance': round(current_balance, 2),
+            'profit_pct': round((current_balance - initial_balance) / initial_balance * 100, 4)
+        })
+    
+    return equity_curve
+
+@shared_task
+def cleanup_old_jobs():
+    """
+    Clean up old backtest jobs and results (run daily)
+    """
+    from datetime import timedelta
+    
+    cutoff_date = timezone.now() - timedelta(days=30)  # Keep for 30 days
+    
+    # Delete old failed/cancelled jobs
+    old_jobs = BacktestJob.objects.filter(
+        created_at__lt=cutoff_date,
+        status__in=['failed', 'cancelled']
+    )
+    
+    count = old_jobs.count()
+    old_jobs.delete()
+    
+    logger.info(f"Cleaned up {count} old backtest jobs")
+    return f"Cleaned up {count} old jobs"
+
+@shared_task
+def download_market_data(pairs, timeframe, start_date, end_date):
+    """
+    Download market data for backtesting
+    """
+    cmd = [
+        'freqtrade',
+        'download-data',
+        '--exchange', 'binance',
+        '--timeframes', timeframe,
+        '--timerange', f"{start_date.replace('-', '')}-{end_date.replace('-', '')}",
+        '--pairs'
+    ] + pairs
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800  # 30 minutes timeout
+        )
+        
+        if result.returncode != 0:
+            raise Exception(f"Data download failed: {result.stderr}")
+            
+        logger.info(f"Downloaded data for {pairs} ({timeframe})")
+        return f"Downloaded data for {len(pairs)} pairs"
+        
+    except subprocess.TimeoutExpired:
+        raise Exception("Data download timed out")
+    except Exception as e:
+        logger.error(f"Data download failed: {str(e)}")
+        raise
+# backtest/urls.py
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from . import views
+
+router = DefaultRouter()
+router.register(r'strategies', views.TradingStrategyViewSet, basename='strategies')
+router.register(r'jobs', views.BacktestJobViewSet, basename='jobs')
+router.register(r'results', views.BacktestResultViewSet, basename='results')
+
+app_name = 'backtest'
+
+urlpatterns = [
+    path('api/', include(router.urls)),
+]
+# backtest\views.py
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.shortcuts import get_object_or_404
+from django.db.models import Q, Count, Avg
+from django_filters.rest_framework import DjangoFilterBackend
+from django.utils import timezone
+import logging
+
+from .models import TradingStrategy, BacktestJob, BacktestResult
+from .serializers import (
+    TradingStrategySerializer, BacktestJobCreateSerializer, 
+    BacktestJobSerializer, BacktestJobListSerializer,
+    BacktestResultSerializer, BacktestResultDetailSerializer
+)
+from .tasks import run_backtest_task  # We'll create this next
+
+logger = logging.getLogger(__name__)
+
+class TradingStrategyViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for listing available trading strategies
+    """
+    queryset = TradingStrategy.objects.filter(is_active=True)
+    serializer_class = TradingStrategySerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['name']
+    
+    @action(detail=True, methods=['get'])
+    def performance_stats(self, request, pk=None):
+        """Get aggregated performance stats for a strategy"""
+        strategy = self.get_object()
+        
+        completed_jobs = BacktestJob.objects.filter(
+            strategy=strategy, 
+            status='completed'
+        ).select_related('result')
+        
+        if not completed_jobs.exists():
+            return Response({
+                'message': 'No completed backtests found for this strategy',
+                'total_backtests': 0
+            })
+        
+        # Aggregate stats
+        results = BacktestResult.objects.filter(job__in=completed_jobs)
+        stats = results.aggregate(
+            avg_return=Avg('total_return_pct'),
+            avg_drawdown=Avg('max_drawdown_pct'),
+            avg_win_rate=Avg('win_rate'),
+            avg_sharpe=Avg('sharpe_ratio'),
+            total_backtests=Count('id')
+        )
+        
+        # Best and worst performing backtests
+        best = results.order_by('-total_return_pct').first()
+        worst = results.order_by('total_return_pct').first()
+        
+        return Response({
+            'strategy_name': strategy.name,
+            'total_backtests': stats['total_backtests'],
+            'average_stats': {
+                'return_pct': round(float(stats['avg_return'] or 0), 2),
+                'max_drawdown_pct': round(float(stats['avg_drawdown'] or 0), 2),
+                'win_rate': round(float(stats['avg_win_rate'] or 0), 2),
+                'sharpe_ratio': round(float(stats['avg_sharpe'] or 0), 3)
+            },
+            'best_performance': {
+                'return_pct': float(best.total_return_pct) if best else None,
+                'job_id': best.job.id if best else None
+            },
+            'worst_performance': {
+                'return_pct': float(worst.total_return_pct) if worst else None,
+                'job_id': worst.job.id if worst else None
+            }
+        })
+
+class BacktestJobViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing backtest jobs
+    """
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['strategy', 'status', 'timeframe']
+    ordering = ['-created_at']
+    
+    def get_queryset(self):
+        queryset = BacktestJob.objects.select_related('strategy', 'result')
+        
+        # Filter by user if authenticated
+        if self.request.user.is_authenticated:
+            queryset = queryset.filter(user=self.request.user)
+        else:
+            # For anonymous users, show only public results
+            queryset = queryset.filter(user__isnull=True)
+            
+        return queryset
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return BacktestJobCreateSerializer
+        elif self.action == 'list':
+            return BacktestJobListSerializer
+        return BacktestJobSerializer
+    
+    def perform_create(self, serializer):
+        # Set user if authenticated
+        job = serializer.save(
+            user=self.request.user if self.request.user.is_authenticated else None
+        )
+        
+        # Queue the backtest task
+        try:
+            run_backtest_task.delay(job.id)
+            logger.info(f"Queued backtest job {job.id}")
+        except Exception as e:
+            logger.error(f"Failed to queue backtest job {job.id}: {e}")
+            job.status = 'failed'
+            job.error_message = f"Failed to queue job: {str(e)}"
+            job.save()
+    
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel a pending or running backtest job"""
+        job = self.get_object()
+        
+        if job.status not in ['pending', 'running']:
+            return Response(
+                {'error': 'Job cannot be cancelled'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        job.status = 'cancelled'
+        job.error_message = 'Cancelled by user'
+        job.save()
+        
+        # TODO: Cancel celery task if running
+        
+        return Response({'message': 'Job cancelled successfully'})
+    
+    @action(detail=True, methods=['post'])
+    def retry(self, request, pk=None):
+        """Retry a failed backtest job"""
+        job = self.get_object()
+        
+        if job.status != 'failed':
+            return Response(
+                {'error': 'Only failed jobs can be retried'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Reset job status
+        job.status = 'pending'
+        job.error_message = ''
+        job.progress = 0
+        job.started_at = None
+        job.completed_at = None
+        job.save()
+        
+        # Delete old result if exists
+        if hasattr(job, 'result'):
+            job.result.delete()
+        
+        # Queue the job again
+        try:
+            run_backtest_task.delay(job.id)
+            logger.info(f"Retrying backtest job {job.id}")
+        except Exception as e:
+            logger.error(f"Failed to retry backtest job {job.id}: {e}")
+            job.status = 'failed'
+            job.error_message = f"Failed to queue retry: {str(e)}"
+            job.save()
+        
+        return Response({'message': 'Job queued for retry'})
+
+class BacktestResultViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for viewing backtest results
+    """
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['job__strategy', 'job__timeframe']
+    ordering = ['-created_at']
+    
+    def get_queryset(self):
+        queryset = BacktestResult.objects.select_related('job__strategy')
+        
+        # Filter by user if authenticated
+        if self.request.user.is_authenticated:
+            queryset = queryset.filter(
+                Q(job__user=self.request.user) | Q(job__user__isnull=True)
+            )
+        else:
+            # Anonymous users see only public results
+            queryset = queryset.filter(job__user__isnull=True)
+            
+        return queryset
+    
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return BacktestResultDetailSerializer
+        return BacktestResultSerializer
+    
+    @action(detail=False, methods=['get'])
+    def leaderboard(self, request):
+        """Get top performing strategies"""
+        limit = int(request.query_params.get('limit', 10))
+        timeframe = request.query_params.get('timeframe', None)
+        
+        queryset = self.get_queryset()
+        
+        if timeframe:
+            queryset = queryset.filter(job__timeframe=timeframe)
+        
+        # Get top performers by total return
+        top_results = queryset.order_by('-total_return_pct')[:limit]
+        
+        leaderboard = []
+        for result in top_results:
+            leaderboard.append({
+                'rank': len(leaderboard) + 1,
+                'strategy_name': result.job.strategy.name,
+                'total_return_pct': float(result.total_return_pct),
+                'max_drawdown_pct': float(result.max_drawdown_pct),
+                'win_rate': float(result.win_rate),
+                'sharpe_ratio': float(result.sharpe_ratio),
+                'total_trades': result.total_trades,
+                'timeframe': result.job.timeframe,
+                'pairs': result.job.pairs,
+                'duration_days': (result.job.end_date - result.job.start_date).days,
+                'job_id': result.job.id,
+                'created_at': result.created_at
+            })
+        
+        return Response({
+            'leaderboard': leaderboard,
+            'filters': {
+                'timeframe': timeframe,
+                'limit': limit
+            }
+        })
+    
+    @action(detail=True, methods=['get'])
+    def equity_curve(self, request, pk=None):
+        """Get equity curve data for charting"""
+        result = self.get_object()
+        return Response({
+            'job_id': result.job.id,
+            'strategy_name': result.job.strategy.name,
+            'equity_curve': result.equity_curve,
+            'initial_balance': float(result.job.initial_balance),
+            'final_balance': float(result.final_balance)
+        })
+    
+    @action(detail=True, methods=['get'])
+    def trades(self, request, pk=None):
+        """Get trade data with pagination"""
+        result = self.get_object()
+        page_size = int(request.query_params.get('page_size', 50))
+        page = int(request.query_params.get('page', 1))
+        
+        trades = result.trades_data
+        total_trades = len(trades)
+        
+        # Simple pagination
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_trades = trades[start_idx:end_idx]
+        
+        return Response({
+            'trades': paginated_trades,
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total_trades': total_trades,
+                'total_pages': (total_trades + page_size - 1) // page_size
+            }
+        })
